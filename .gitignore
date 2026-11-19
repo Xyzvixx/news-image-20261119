@@ -1,5 +1,5 @@
+# Ignore local build artefacts and generated output
 __pycache__/
 *.pyc
-/out/
-*.log
-.DS_Store
+/output/
+transcripts.tar.gz

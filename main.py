@@ -1,79 +1,127 @@
 #!/usr/bin/env python3
-"""News-image entry for make.fun bounty news-image-20261119.
+"""Validate and copy the news-image entry PNG.
 
-Writes the day's front-page image (entry.png, held in this repository) to
-/output/entry.png. Python 3.13, standard library only, no network: the
-program copies the image byte for byte, so two runs write identical bytes.
+Reads ``entry.png`` sitting next to this script, validates it strictly
+as a PNG (signature, per-chunk CRCs, IHDR dimensions of at most
+1024x1024, a terminating IEND chunk with nothing after it), then copies
+the bytes verbatim to ``<output-dir>/entry.png`` and re-reads the copy
+to prove it is byte-identical to the source.
 
-Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
-    mkdir -p out && MAKEFUN_OUTPUT_DIR=out python3 main.py
+Usage:
+    python3 main.py [output-dir]
+
+The output directory defaults to ``/output``. Only the Python standard
+library is used; there is no network access and the output is fully
+deterministic.
 """
 
-import os
+from __future__ import annotations
+
+import hashlib
 import struct
 import sys
 import zlib
+from pathlib import Path
 
-IMAGE_NAME = "entry.png"
-MAX_BYTES = 1048576  # 1 MiB
-MAX_SIDE = 1024
-
-
-def repo_image_path():
-    here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, IMAGE_NAME)
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+MAX_DIMENSION = 1024
 
 
-def verify_png(data):
-    """Check the image is a whole PNG within the bounty limits."""
-    if len(data) > MAX_BYTES:
-        raise SystemExit(f"entry.png is {len(data)} bytes, over the 1 MiB limit")
-    if data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise SystemExit("entry.png is not a PNG (bad signature)")
-    # Walk every chunk, checking its CRC, so a truncated file is refused.
-    pos = 8
-    saw_ihdr = saw_iend = False
-    while pos < len(data):
-        if pos + 8 > len(data):
-            raise SystemExit("entry.png is truncated (short chunk header)")
-        length, ctype = struct.unpack(">I4s", data[pos:pos + 8])
-        end = pos + 12 + length
-        if end > len(data):
-            raise SystemExit("entry.png is truncated (short chunk body)")
-        crc = zlib.crc32(data[pos + 4:end - 4]) & 0xFFFFFFFF
-        if struct.unpack(">I", data[end - 4:end])[0] != crc:
-            raise SystemExit(f"entry.png has a bad CRC in chunk {ctype!r}")
-        if ctype == b"IHDR":
-            width, height = struct.unpack(">II", data[pos + 8:pos + 16])
-            if width > MAX_SIDE or height > MAX_SIDE:
-                raise SystemExit(f"entry.png is {width}x{height}, over 1024x1024")
-            saw_ihdr = True
-        if ctype == b"IEND":
-            saw_iend = True
-            if end != len(data):
-                raise SystemExit("entry.png has trailing bytes after IEND")
-        pos = end
-    if not saw_ihdr or not saw_iend:
-        raise SystemExit("entry.png is missing IHDR or IEND")
+class ValidationError(ValueError):
+    """Raised when entry.png fails strict PNG validation."""
 
 
-def main():
-    with open(repo_image_path(), "rb") as f:
-        data = f.read()
-    verify_png(data)
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, IMAGE_NAME)
-    with open(out_path, "wb") as f:
-        f.write(data)
-    # Read the output back: the grader runs the program twice and both
-    # runs must write the same bytes, so confirm what landed on disk.
-    with open(out_path, "rb") as f:
-        written = f.read()
-    if written != data:
-        raise SystemExit(f"{out_path} does not match {IMAGE_NAME}")
-    print(f"wrote {out_path} ({len(data)} bytes)")
+def validate_png(data: bytes) -> tuple[int, int]:
+    """Check *data* is a well-formed PNG; return (width, height)."""
+    if len(data) < len(PNG_SIGNATURE) or data[:8] != PNG_SIGNATURE:
+        raise ValidationError("missing or incorrect PNG signature")
+
+    offset = 8
+    first_chunk = True
+    width = 0
+    height = 0
+
+    while True:
+        if offset + 8 > len(data):
+            raise ValidationError("truncated chunk header")
+        length = struct.unpack(">I", data[offset:offset + 4])[0]
+        chunk_type = data[offset + 4:offset + 8]
+        offset += 8
+        if offset + length + 4 > len(data):
+            raise ValidationError("truncated chunk body")
+        chunk_data = data[offset:offset + length]
+        offset += length
+        stored_crc = struct.unpack(">I", data[offset:offset + 4])[0]
+        offset += 4
+        actual_crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
+        if stored_crc != actual_crc:
+            raise ValidationError(
+                "CRC mismatch in chunk " + chunk_type.decode("latin-1")
+            )
+
+        if first_chunk:
+            if chunk_type != b"IHDR":
+                raise ValidationError("first chunk must be IHDR")
+            if len(chunk_data) != 13:
+                raise ValidationError("IHDR chunk must be 13 bytes long")
+            width, height = struct.unpack(">II", chunk_data[:8])
+            if width == 0 or height == 0:
+                raise ValidationError("IHDR dimensions must be positive")
+            if width > MAX_DIMENSION or height > MAX_DIMENSION:
+                raise ValidationError(
+                    f"dimensions {width}x{height} exceed "
+                    f"{MAX_DIMENSION}px limit"
+                )
+            first_chunk = False
+        elif chunk_type == b"IHDR":
+            raise ValidationError("duplicate IHDR chunk")
+
+        if chunk_type == b"IEND":
+            if len(chunk_data) != 0:
+                raise ValidationError("IEND chunk must be empty")
+            if offset != len(data):
+                raise ValidationError("trailing bytes after IEND chunk")
+            return width, height
+
+
+def run(argv: list[str]) -> int:
+    """Entry point; returns a process exit code."""
+    if len(argv) > 2:
+        print("usage: main.py [output-dir]", file=sys.stderr)
+        return 2
+
+    source = Path(__file__).resolve().parent / "entry.png"
+    output_dir = Path(argv[1]) if len(argv) == 2 else Path("/output")
+
+    try:
+        raw = source.read_bytes()
+    except OSError as exc:
+        print(f"error: cannot read {source}: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        width, height = validate_png(raw)
+    except ValidationError as exc:
+        print(f"error: invalid entry.png: {exc}", file=sys.stderr)
+        return 1
+
+    target = output_dir / "entry.png"
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+        copied = target.read_bytes()
+    except OSError as exc:
+        print(f"error: cannot write {target}: {exc}", file=sys.stderr)
+        return 1
+
+    if copied != raw:
+        print("error: copied bytes differ from source", file=sys.stderr)
+        return 1
+
+    digest = hashlib.sha256(copied).hexdigest()
+    print(f"ok: {width}x{height}, {len(raw)} bytes, sha256={digest} -> {target}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(run(sys.argv))
