@@ -17,6 +17,7 @@ verifies the PNG, then copies it to /output/entry.png.
 
 import argparse
 import hashlib
+import os
 import shutil
 import struct
 import sys
@@ -533,28 +534,74 @@ def verify_png(path):
     return dims, len(data)
 
 
+def _save_png(img, directory):
+    """Try to write entry.png into directory. Return the Path on success,
+    None on any OSError (e.g. PermissionError when the dir is read-only).
+    A failed write here must never abort the run; the caller falls back
+    to the next writable directory."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    path = directory / "entry.png"
+    try:
+        img.save(path, format="PNG", compress_level=6)
+    except OSError:
+        return None
+    return path
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--outdir", default=None)
     args = ap.parse_args()
     base_dir = Path(__file__).resolve().parent
-    outdir = Path(args.outdir) if args.outdir else base_dir
-    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Output-directory priority. The grader mounts /bot read-only, so
+    # base_dir is only a last resort and only when actually writable:
+    #   1. explicit --outdir
+    #   2. $MAKEFUN_OUTPUT_DIR (grader-provided writable dir)
+    #   3. /output
+    #   4. base_dir
+    env_out = os.environ.get("MAKEFUN_OUTPUT_DIR", "").strip()
+    candidates = []
+    for cand in (args.outdir, env_out or None, "/output", str(base_dir)):
+        if not cand:
+            continue
+        p = Path(cand)
+        if p not in candidates:
+            candidates.append(p)
 
     img = render(base_dir)
-    out_path = outdir / "entry.png"
-    img.save(out_path, format="PNG", compress_level=6)
+
+    # Save to the first writable candidate; a read-only dir (e.g. /bot)
+    # is skipped silently instead of raising PermissionError -> exit 1.
+    out_path = None
+    for cand in candidates:
+        out_path = _save_png(img, cand)
+        if out_path is not None:
+            break
+    if out_path is None:
+        print("FAIL: could not write entry.png to any writable directory",
+              file=sys.stderr)
+        return 1
     dims, size = verify_png(out_path)
     sha = hashlib.sha256(out_path.read_bytes()).hexdigest()
     print(f"entry.png: {dims[0]}x{dims[1]}, {size} bytes, sha256 {sha}")
+    print(f"wrote {out_path}")
 
-    out_root = Path("/output")
-    try:
-        out_root.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(out_path, out_root / "entry.png")
-        print(f"copied to {out_root / 'entry.png'}")
-    except OSError as exc:
-        print(f"warning: could not copy to /output: {exc}", file=sys.stderr)
+    # Best-effort mirrors: also place a copy in /output and in
+    # $MAKEFUN_OUTPUT_DIR when they differ from where we saved.
+    # A failed mirror must never fail the run.
+    for mirror in (Path("/output"), Path(env_out) if env_out else None):
+        if mirror is None or mirror == out_path.parent:
+            continue
+        try:
+            mirror.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(out_path, mirror / "entry.png")
+            print(f"copied to {mirror / 'entry.png'}")
+        except OSError as exc:
+            print(f"warning: could not copy to {mirror}: {exc}", file=sys.stderr)
     return 0
 
 
